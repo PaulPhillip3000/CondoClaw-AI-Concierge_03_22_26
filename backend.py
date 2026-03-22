@@ -1992,6 +1992,9 @@ async def generate_ledger(request: LedgerRequest):
                 nola_balance_anchor = _cat_sum
                 nola_anchor_source = "line_item_sum"
 
+    # Save raw snapshot for Association Ledger sheet (before NOLA filter)
+    raw_line_items = list(line_items)
+
     # Filter line_items to post-NOLA only and prepend NOLA opening balance row
     nola_consistency_flag = None
     if nola_date_anchor and line_items:
@@ -2031,6 +2034,47 @@ async def generate_ledger(request: LedgerRequest):
         totals["assessments"] + totals["interest"] + totals["late_fees"] + totals["atty_fees"]
         + totals["other"] - totals["credits"], 2
     )
+
+    # ── Association Ledger: compute ledger-derived running balance AT NOLA date ─
+    # Used by NOLA Validation sheet to apply 3-tier tolerance. PRD §42.5
+    ledger_balance_at_nola = None
+    if nola_date_anchor and raw_line_items:
+        _running_val = 0.0
+        for _t in raw_line_items:
+            _td_val = None
+            for _fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+                try:
+                    _td_val = datetime.datetime.strptime(str(_t.get("date", "")), _fmt).date()
+                    break
+                except (ValueError, AttributeError):
+                    pass
+            if _td_val is None or _td_val <= nola_date_anchor:
+                _running_val += _to_float(_t.get("charge", 0)) - _to_float(_t.get("credit", 0))
+        ledger_balance_at_nola = round(_running_val, 2)
+
+    # ── 45-day forward projection rows for NOLA-Ledger (PRD §42.6) ────────────
+    _projection_rows = []
+    _monthly_rate = _to_float(e.get("monthly_assessment", "0"))
+    if _monthly_rate > 0:
+        _today_proj = datetime.date.today()
+        _proj_end   = _today_proj + datetime.timedelta(days=45)
+        _proj_cur   = (
+            datetime.date(_today_proj.year + 1, 1, 1) if _today_proj.month == 12
+            else datetime.date(_today_proj.year, _today_proj.month + 1, 1)
+        )
+        while _proj_cur <= _proj_end:
+            _projection_rows.append({
+                "date":        _proj_cur.strftime("%m/%d/%Y"),
+                "description": f"Projected Assessment — {_proj_cur.strftime('%B %Y')}",
+                "type":        "Projected Assessment",
+                "charge":      _monthly_rate,
+                "credit":      0.0,
+                "notes":       "45-day forward projection — not yet due",
+            })
+            _proj_cur = (
+                datetime.date(_proj_cur.year + 1, 1, 1) if _proj_cur.month == 12
+                else datetime.date(_proj_cur.year, _proj_cur.month + 1, 1)
+            )
 
     # Build merged dict for IQ-225 — derive monthly_assessment from mode of ledger charges
     from collections import Counter as _LedgerCounter
@@ -2174,7 +2218,280 @@ async def generate_ledger(request: LedgerRequest):
 
         with pd.ExcelWriter(str(out_path), engine="openpyxl") as writer:
 
-            # ── Sheet 1: Statement of Account (always first — PRD requirement) ──
+            ledger_cols = [
+                "#", "Date", "Description", "Type",
+                "Assessments ($)", "Interest ($)", "Late Fees ($)",
+                "Atty Fees ($)", "Other ($)", "Credits ($)",
+                "Running Balance ($)", "Notes",
+            ]
+            col_widths = [5, 13, 42, 20, 16, 14, 14, 14, 12, 12, 20, 22]
+
+            # ── Sheet 1: NOLA-Ledger ──────────────────────────────────────────
+            # NOLA as locked opening row, post-NOLA charges by category,
+            # 45-day forward projection. PRD §42.2, §42.6
+            nola_ledger_items = list(line_items)
+            if _projection_rows:
+                nola_ledger_items.append({
+                    "date": "", "description": "── 45-DAY FORWARD PROJECTION (PRD §42.6) ──",
+                    "type": "Separator", "charge": 0.0, "credit": 0.0,
+                    "notes": "Projected charges — 45-day cure window",
+                })
+                nola_ledger_items.extend(_projection_rows)
+
+            nl_split_rows = []
+            _nl_running   = 0.0
+            for _nl_idx, _nl_row in enumerate(nola_ledger_items, 1):
+                _charge  = _to_float(_nl_row.get("charge", 0))
+                _credit  = _to_float(_nl_row.get("credit", 0))
+                _rtype   = _nl_row.get("type", "Other")
+                _is_sep  = _rtype == "Separator"
+                _is_proj = _rtype == "Projected Assessment"
+                if not _is_sep:
+                    _nl_running = round(_nl_running + _charge - _credit, 2)
+                _bkt = TYPE_MAP.get(_rtype, "other")
+                nl_split_rows.append([
+                    "" if _is_sep else _nl_idx,
+                    _nl_row.get("date", ""),
+                    _nl_row.get("description", ""),
+                    _rtype,
+                    _charge if _bkt == "assessments" and not _is_sep else "",
+                    _charge if _bkt == "interest"    and not _is_sep else "",
+                    _charge if _bkt == "late_fees"   and not _is_sep else "",
+                    _charge if _bkt == "atty_fees"   and not _is_sep else "",
+                    _charge if (_is_proj or _bkt == "other") and not _is_sep else "",
+                    _credit if _credit > 0           and not _is_sep else "",
+                    "" if _is_sep else _nl_running,
+                    _nl_row.get("notes", ""),
+                ])
+
+            df_nl = pd.DataFrame(nl_split_rows, columns=ledger_cols)
+            df_nl.to_excel(writer, sheet_name="NOLA-Ledger", index=False)
+            ws_nl = writer.sheets["NOLA-Ledger"]
+            for i, w in enumerate(col_widths, 1):
+                ws_nl.column_dimensions[get_column_letter(i)].width = w
+            for cell in ws_nl[1]:
+                cell.font      = Font(bold=True, color="FFFFFF", size=10)
+                cell.fill      = navy
+                cell.border    = thin
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            _proj_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+            _sep_fill  = PatternFill(start_color="1B2A4A", end_color="1B2A4A", fill_type="solid")
+            for row in ws_nl.iter_rows(min_row=2, max_row=ws_nl.max_row):
+                _desc_v  = str(row[2].value or "")
+                _type_v  = str(row[3].value or "")
+                _is_nola = "Balance per Notice of Late Assessment" in _desc_v
+                _is_sep  = _type_v == "Separator"
+                _is_proj = _type_v == "Projected Assessment"
+                for cell in row:
+                    cell.border    = thin
+                    cell.alignment = Alignment(vertical="center")
+                    if _is_nola:
+                        cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                        cell.font = Font(bold=True, size=10)
+                    elif _is_sep:
+                        cell.fill      = _sep_fill
+                        cell.font      = Font(bold=True, color="FFFFFF", size=9, italic=True)
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                    elif _is_proj:
+                        cell.fill = _proj_fill
+                        cell.font = Font(italic=True, size=9)
+
+            # Totals row
+            _nl_tot_row = ws_nl.max_row + 1
+            _nl_tot_vals = [
+                "", "", "TOTALS", "",
+                totals["assessments"] or "",
+                totals["interest"]    or "",
+                totals["late_fees"]   or "",
+                totals["atty_fees"]   or "",
+                totals["other"]       or "",
+                totals["credits"]     or "",
+                net_balance, "",
+            ]
+            for _ci, _cv in enumerate(_nl_tot_vals, 1):
+                _tc = ws_nl.cell(row=_nl_tot_row, column=_ci, value=_cv)
+                _tc.font      = Font(bold=True, size=11)
+                _tc.fill      = gold
+                _tc.border    = thin
+                _tc.alignment = Alignment(horizontal="center")
+
+            # Summary block
+            _nl_sum_start = _nl_tot_row + 2
+            _nl_cheat = [
+                ("TOTALS SUMMARY", ""),
+                ("Total Assessments",   f"${totals['assessments']:.2f}"),
+                ("Total Interest",      f"${totals['interest']:.2f}"),
+                ("Total Late Fees",     f"${totals['late_fees']:.2f}"),
+                ("Total Attorney Fees", f"${totals['atty_fees']:.2f}"),
+                ("Total Other",         f"${totals['other']:.2f}" if totals["other"] else "$0.00"),
+                ("Total Credits",       f"-${totals['credits']:.2f}" if totals["credits"] else "$0.00"),
+                ("NET BALANCE DUE",     f"${net_balance:.2f}"),
+            ]
+            for _ro, (_lbl, _lv) in enumerate(_nl_cheat):
+                _r    = _nl_sum_start + _ro
+                _cl   = ws_nl.cell(row=_r, column=1, value=_lbl)
+                _cv2  = ws_nl.cell(row=_r, column=2, value=_lv)
+                _hdr  = _lbl in ("TOTALS SUMMARY", "NET BALANCE DUE")
+                for _c in (_cl, _cv2):
+                    _c.border = thin
+                    _c.font   = Font(bold=True, size=11 if _hdr else 10,
+                                     color="FFFFFF" if _lbl == "TOTALS SUMMARY" else "000000")
+                    _c.fill   = (navy if _lbl == "TOTALS SUMMARY"
+                                 else gold if _lbl == "NET BALANCE DUE" else lt_blue)
+
+            # ── Sheet 2: Association Ledger ───────────────────────────────────
+            # Structured view of raw uploaded ledger — reconciliation reference only.
+            # NOT used for output generation. PRD §42.3
+            al_split_rows = []
+            _al_running   = 0.0
+            for _al_idx, _al_row in enumerate(raw_line_items, 1):
+                _ac = _to_float(_al_row.get("charge", 0))
+                _ar = _to_float(_al_row.get("credit", 0))
+                _al_running = round(_al_running + _ac - _ar, 2)
+                _at  = _al_row.get("type", "Other")
+                _abk = TYPE_MAP.get(_at, "other")
+                al_split_rows.append([
+                    _al_idx,
+                    _al_row.get("date", ""),
+                    _al_row.get("description", ""),
+                    _at,
+                    _ac if _abk == "assessments" else "",
+                    _ac if _abk == "interest"    else "",
+                    _ac if _abk == "late_fees"   else "",
+                    _ac if _abk == "atty_fees"   else "",
+                    _ac if _abk == "other"       else "",
+                    _ar if _ar > 0               else "",
+                    _al_running,
+                    _al_row.get("notes", ""),
+                ])
+
+            df_al = pd.DataFrame(al_split_rows, columns=ledger_cols)
+            df_al.to_excel(writer, sheet_name="Association Ledger", index=False)
+            ws_al = writer.sheets["Association Ledger"]
+            for i, w in enumerate(col_widths, 1):
+                ws_al.column_dimensions[get_column_letter(i)].width = w
+            for cell in ws_al[1]:
+                cell.font      = Font(bold=True, color="FFFFFF", size=10)
+                cell.fill      = navy
+                cell.border    = thin
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            for row in ws_al.iter_rows(min_row=2, max_row=ws_al.max_row):
+                for cell in row:
+                    cell.border    = thin
+                    cell.alignment = Alignment(vertical="center")
+            _al_note_r = ws_al.max_row + 2
+            _al_nc = ws_al.cell(
+                row=_al_note_r, column=1,
+                value=(
+                    "RECONCILIATION REFERENCE ONLY — This sheet reflects the uploaded management "
+                    "company ledger in standardized format. It is NOT used for output generation. "
+                    "The NOLA is the controlling dataset. (PRD §42.3)"
+                )
+            )
+            _al_nc.font = Font(bold=True, italic=True, size=8, color="595959")
+            _al_nc.fill = lt_blue
+
+            # ── Sheet 3: NOLA Validation ──────────────────────────────────────
+            # 3-tier Good/Bad NOLA comparison. PRD §42.4, §42.5
+            _vdelta = None
+            _vpct   = None
+            if nola_balance_anchor is not None and ledger_balance_at_nola is not None:
+                _vdelta = abs(nola_balance_anchor - ledger_balance_at_nola)
+                _vpct   = (_vdelta / nola_balance_anchor * 100) if nola_balance_anchor else None
+
+            if _vdelta is None:
+                _vstatus = "⏳ PENDING — NOLA or ledger balance not available for comparison"
+                _vcolor  = "FFEB9C"
+                _vtier   = "PENDING"
+            elif _vdelta <= 1.00:
+                _vstatus = "✅ GOOD NOLA — Within rounding tolerance (≤ $1.00). Proceed."
+                _vcolor  = "C6EFCE"
+                _vtier   = "GOOD"
+            elif _vdelta <= 50.00:
+                _vstatus = (
+                    f"⚠️  MINOR VARIANCE — ${_vdelta:.2f} difference. "
+                    f"Attorney acknowledgment required before proceeding."
+                )
+                _vcolor  = "FFEB9C"
+                _vtier   = "MINOR"
+            else:
+                _vstatus = (
+                    f"🔴 BAD NOLA — MATERIAL DISCREPANCY: ${_vdelta:.2f} difference. "
+                    f"Explicit override + logging required. See PRD §42.5."
+                )
+                _vcolor  = "FFC7CE"
+                _vtier   = "BAD"
+
+            _val_rows = [
+                ("NOLA VALIDATION", ""),
+                ("NOLA Date",
+                 nola_date_anchor.strftime("%m/%d/%Y") if nola_date_anchor else "Not found"),
+                ("NOLA Stated Balance",
+                 f"${nola_balance_anchor:.2f}" if nola_balance_anchor is not None else "Not found"),
+                ("Ledger-Derived Balance (at NOLA date)",
+                 f"${ledger_balance_at_nola:.2f}" if ledger_balance_at_nola is not None else "Not computed"),
+                ("Variance (Absolute)",  f"${_vdelta:.2f}"  if _vdelta is not None else "N/A"),
+                ("Variance (%)",         f"{_vpct:.2f}%"    if _vpct  is not None else "N/A"),
+                ("", ""),
+                ("TOLERANCE TIERS (PRD §42.5)", ""),
+                ("≤ $1.00",         "✅ Rounding — Green (no flag, proceed)"),
+                ("$1.01 – $50.00",  "⚠️  Minor Variance — Yellow (attorney acknowledgment required)"),
+                ("> $50.00",        "🔴 Bad NOLA — Red (explicit override + logging required)"),
+                ("", ""),
+                ("DETERMINATION", ""),
+                ("Status", _vstatus),
+                ("Tier",   _vtier),
+                ("NOLA Balance Source", nola_anchor_source if nola_balance_anchor else "N/A"),
+                ("", ""),
+                ("LEGAL BASIS", ""),
+                ("FL Statute",
+                 "F.S. 718.116(8) — Any amount overstated in estoppel is waived; no de minimis floor."),
+                ("Case Law",
+                 "Rajabi v. Villas at Lakeside, 306 So.3d 400 (5th DCA 2020) — "
+                 "Inflated uncredited balance unenforceable."),
+                ("FDCPA",
+                 "15 U.S.C. 1692k(c) — Bona fide error defense requires documented reasonable procedures."),
+                ("GAAP Note",
+                 "GAAP 5% materiality does NOT apply to individual collection demand letters."),
+                ("", ""),
+                ("ACTION REQUIRED", ""),
+                ("Attorney Review",
+                 ("Required — document acknowledgment before proceeding" if _vtier == "MINOR"
+                  else "Required — documented override mandatory, do NOT proceed without logging"
+                  if _vtier == "BAD" else "None — proceed")),
+                ("Override Logging",
+                 ("N/A" if _vtier in ("GOOD", "PENDING")
+                  else "Log override with timestamp and attorney identity")),
+            ]
+
+            df_val = pd.DataFrame(_val_rows, columns=["Field", "Value"])
+            df_val.to_excel(writer, sheet_name="NOLA Validation", index=False)
+            ws_val = writer.sheets["NOLA Validation"]
+            ws_val.column_dimensions["A"].width = 45
+            ws_val.column_dimensions["B"].width = 80
+            _vfill = PatternFill(start_color=_vcolor, end_color=_vcolor, fill_type="solid")
+            for row in ws_val.iter_rows():
+                _fv = str(row[0].value or "")
+                _vv = str(row[1].value or "")
+                _is_sec  = _fv.isupper() and not _vv.strip() and len(_fv) > 3
+                _is_stat = _fv == "Status"
+                for cell in row:
+                    cell.border    = thin
+                    cell.alignment = Alignment(wrap_text=True, vertical="center")
+                if _is_sec:
+                    for cell in row:
+                        cell.font = Font(bold=True, color="FFFFFF", size=10)
+                        cell.fill = navy
+                elif _is_stat:
+                    for cell in row:
+                        cell.font = Font(bold=True, size=10)
+                        cell.fill = _vfill
+                else:
+                    row[0].font = Font(bold=True, size=9)
+                    row[1].font = Font(size=9)
+            ws_val.freeze_panes = "A2"
+
+            # ── Sheet 4: Statement of Account ─────────────────────────────────
             # Build SOA rows from IQ-225 table; fall back to ledger totals if unavailable
             if iq_tbl:
                 through_lbl = iq_tbl["through_date_str"]
@@ -2194,7 +2511,6 @@ async def generate_ledger(request: LedgerRequest):
                     f"NOLA Opening Balance: ${nola_balance_anchor:.2f}" if nola_balance_anchor else ""
                 )
             else:
-                # Fallback: build from raw ledger totals
                 soa_rows = [
                     ("Maintenance / Assessments",  totals["assessments"]),
                     ("Special Assessments",        totals.get("special_assessments", 0.0)),
@@ -2212,29 +2528,25 @@ async def generate_ledger(request: LedgerRequest):
             ws_soa = writer.sheets["Statement of Account"]
             ws_soa.column_dimensions["A"].width = 58
             ws_soa.column_dimensions["B"].width = 18
-            # Header row
             for cell in ws_soa[1]:
-                cell.font  = Font(bold=True, color="FFFFFF", size=11)
-                cell.fill  = navy
-                cell.border = thin
+                cell.font      = Font(bold=True, color="FFFFFF", size=11)
+                cell.fill      = navy
+                cell.border    = thin
                 cell.alignment = Alignment(horizontal="center")
-            # Data rows
             for row in ws_soa.iter_rows(min_row=2):
                 is_total = "TOTAL" in str(row[0].value or "")
                 for cell in row:
-                    cell.border = thin
+                    cell.border    = thin
                     cell.alignment = Alignment(vertical="center")
-                    cell.font = Font(bold=is_total, size=12 if is_total else 10)
+                    cell.font      = Font(bold=is_total, size=12 if is_total else 10)
                 if is_total:
                     for cell in row:
                         cell.fill = gold
-            # NOLA source note in row below data
             _note_row = ws_soa.max_row + 2
             if _soa_nola_note:
                 _nc = ws_soa.cell(row=_note_row, column=1, value=_soa_nola_note)
                 _nc.font = Font(italic=True, size=8)
-
-            # NOLA consistency check — flag if letter total diverges from NOLA balance
+            # NOLA consistency cross-check on SOA (mirrors NOLA Validation tier)
             if nola_balance_anchor and iq_tbl:
                 _letter_total = float(iq_tbl["total_outstanding"])
                 _delta = abs(_letter_total - nola_balance_anchor)
@@ -2243,105 +2555,17 @@ async def generate_ledger(request: LedgerRequest):
                     _fc = ws_soa.cell(
                         row=_flag_row, column=1,
                         value=(
-                            f"⚠ NOLA CONSISTENCY FLAG: NOLA stated ${nola_balance_anchor:.2f} | "
-                            f"Letter total ${_letter_total:.2f} | Delta ${_delta:.2f} — Attorney review required"
+                            f"{'⚠️' if _delta <= 50 else '🔴'} NOLA CONSISTENCY FLAG: "
+                            f"NOLA stated ${nola_balance_anchor:.2f} | "
+                            f"Letter total ${_letter_total:.2f} | "
+                            f"Delta ${_delta:.2f} — "
+                            f"{'Minor variance — attorney acknowledgment required' if _delta <= 50 else 'MATERIAL DISCREPANCY — override required (see NOLA Validation sheet)'}"
                         )
                     )
-                    _fc.font = Font(bold=True, color="FF0000", size=9)
+                    _fc.font = Font(bold=True, color="FF0000" if _delta > 50 else "CC6600", size=9)
                     _fc.fill = flag_f
 
-            # ── Sheet 2: Ledger Detail ────────────────────────────────────────
-            ledger_cols = [
-                "#", "Date", "Description", "Type",
-                "Assessments ($)", "Interest ($)", "Late Fees ($)",
-                "Atty Fees ($)", "Other ($)", "Credits ($)",
-                "Running Balance ($)", "Notes",
-            ]
-
-            # Re-map ledger_rows to split charge into typed columns
-            split_rows = []
-            for row in ledger_rows:
-                idx, date, desc, ttype, charge, credit, bal, notes = row
-                charge = charge if charge != "" else 0.0
-                credit = credit if credit != "" else 0.0
-                bucket = TYPE_MAP.get(ttype, "other")
-                split_rows.append([
-                    idx, date, desc, ttype,
-                    charge if bucket == "assessments" else "",
-                    charge if bucket == "interest"    else "",
-                    charge if bucket == "late_fees"   else "",
-                    charge if bucket == "atty_fees"   else "",
-                    charge if bucket == "other"       else "",
-                    credit if credit > 0              else "",
-                    bal,
-                    notes,
-                ])
-
-            df2 = pd.DataFrame(split_rows, columns=ledger_cols)
-            df2.to_excel(writer, sheet_name="Ledger Detail", index=False)
-            ws2 = writer.sheets["Ledger Detail"]
-            col_widths = [5, 13, 42, 20, 16, 14, 14, 14, 12, 12, 20, 22]
-            for i, w in enumerate(col_widths, 1):
-                ws2.column_dimensions[get_column_letter(i)].width = w
-            for cell in ws2[1]:
-                cell.font  = Font(bold=True, color="FFFFFF", size=10)
-                cell.fill  = navy
-                cell.border = thin
-                cell.alignment = Alignment(horizontal="center", wrap_text=True)
-            # Highlight NOLA anchor row (row 2 = first data row)
-            for row in ws2.iter_rows(min_row=2, max_row=ws2.max_row):
-                is_nola_row = "Balance per Notice of Late Assessment" in str(row[2].value or "")
-                for cell in row:
-                    cell.border = thin
-                    cell.alignment = Alignment(vertical="center")
-                    if is_nola_row:
-                        cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-                        cell.font = Font(bold=True, size=10)
-
-            # Totals row
-            totals_row_idx = ws2.max_row + 1
-            totals_values  = [
-                "", "", "TOTALS", "",
-                totals["assessments"] or "",
-                totals["interest"]    or "",
-                totals["late_fees"]   or "",
-                totals["atty_fees"]   or "",
-                totals["other"]       or "",
-                totals["credits"]     or "",
-                net_balance,
-                "",
-            ]
-            for col_idx, val in enumerate(totals_values, 1):
-                cell = ws2.cell(row=totals_row_idx, column=col_idx, value=val)
-                cell.font   = Font(bold=True, size=11)
-                cell.fill   = gold
-                cell.border = thin
-                cell.alignment = Alignment(horizontal="center")
-
-            # Summary block below totals
-            summary_start = totals_row_idx + 2
-            cheat_labels = [
-                ("TOTALS SUMMARY", ""),
-                ("Total Assessments",   f"${totals['assessments']:.2f}"),
-                ("Total Interest",      f"${totals['interest']:.2f}"),
-                ("Total Late Fees",     f"${totals['late_fees']:.2f}"),
-                ("Total Attorney Fees", f"${totals['atty_fees']:.2f}"),
-                ("Total Other",         f"${totals['other']:.2f}" if totals["other"] else "$0.00"),
-                ("Total Credits",       f"-${totals['credits']:.2f}" if totals["credits"] else "$0.00"),
-                ("NET BALANCE DUE",     f"${net_balance:.2f}"),
-            ]
-            for r_off, (label, val) in enumerate(cheat_labels):
-                r = summary_start + r_off
-                c_label = ws2.cell(row=r, column=1, value=label)
-                c_val   = ws2.cell(row=r, column=2, value=val)
-                is_hdr  = label in ("TOTALS SUMMARY", "NET BALANCE DUE")
-                for c in (c_label, c_val):
-                    c.border = thin
-                    c.font   = Font(bold=True, size=11 if is_hdr else 10,
-                                    color="FFFFFF" if label == "TOTALS SUMMARY" else "000000")
-                    c.fill   = navy if label == "TOTALS SUMMARY" else (gold if label == "NET BALANCE DUE" else lt_blue)
-
-            # ── Sheet 3: Unit Owner Profile ───────────────────────────────────
+            # ── Sheet 5: Unit Owner Profile ───────────────────────────────────
             df3 = pd.DataFrame(cheat_rows, columns=["Field", "Value"])
             df3.to_excel(writer, sheet_name="Unit Owner Profile", index=False)
             ws3 = writer.sheets["Unit Owner Profile"]
